@@ -11,4 +11,5 @@ mkdir -p log
 export OPAMJOBS=1
 while true; do
    $DIR/ocamlot_cmd.native work $URL
+   sleep 5
 done
