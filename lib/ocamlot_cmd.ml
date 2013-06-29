@@ -268,7 +268,94 @@ let work_url url_str = Lwt_main.run (
     (Uri.of_string url_str)
 )
 
-let infox ()  =
+module StringSet = Set.Make(String)
+type triage =
+  | Retry of Ocamlot.task
+  | Reclassify of Ocamlot.task * Result.analyses * Result.analyses
+let flip f a b = f b a
+let triage dryrun meta transient system retry domain = Lwt_main.run begin
+  let enset = List.fold_left (flip StringSet.add) StringSet.empty in
+  let retry = enset retry in
+  let domain_set = StringSet.union retry (enset domain) in
+  let domain_p x = match domain with
+    | [] -> true
+    | _ -> StringSet.mem x domain_set in
+  let { user; repo } = main_repo in
+  let state_path = Serve.state_path_of_github_repo (user, repo) in
+  let retry_pkgs_p = List.exists ((flip StringSet.mem) retry) in
+  let rec retry_p pkgs analysis =
+    match category_of_analysis analysis, analysis with
+      | Fixable, _ -> meta
+      | Transient, _ -> transient
+      | System, _ -> system
+      | _, Dep_error (pkg,[])
+      | _, No_solution (Some (Unsatisfied_dep pkg)) -> StringSet.mem pkg retry
+      | _, Dep_error (pkg,analyses) ->
+          retry_pkgs_p [pkg] || List.exists (retry_p [pkg]) analyses
+      | (Incompat | Dependency | Ext_dep | Errorwarn | Broken), _ -> false
+  in
+  catch (fun () ->
+    Goal.read_tasks state_path
+    >>= fun tasks ->
+    let tasks = Goal.filter_map_tasks (fun task ->
+      match task.Ocamlot.log with
+        | (t,Ocamlot.Completed (wid, ({ Result.status = Failed (reasons, error) }
+                                         as result)))::log ->
+            let open Result in
+            let report = analyze error in
+            let Ocamlot.Opam { Opam_task.packages } = task.Ocamlot.job in
+            if List.exists domain_p packages
+            then
+              let status = Failed (report, error) in
+              let result = { result with Result.status } in
+              let last_event = Ocamlot.Completed (wid, result) in
+              let task = { task with Ocamlot.log = (t,last_event)::log } in
+              if retry_pkgs_p packages || List.exists (retry_p packages) report
+              then Some (Retry task)
+              else if report <> reasons
+              then Some (Reclassify (task, reasons, report))
+              else None
+              else None
+        | _ -> None
+    ) tasks in
+    let task_path = Filename.concat state_path Goal.task_subpath in
+    let rel_url_of_tid tid =
+      Printf.sprintf "/github/%s/%s/%s/%s"
+        user repo Goal.task_subpath tid
+    in
+    Lwt_list.map_s (fun (tid, action) ->
+      let file = Filename.(concat task_path tid) in
+      match action with
+        | Retry task ->
+            (if dryrun then return ()
+             else Repo.rm ~path:file >>= fun _ -> return ())
+            >>= fun () ->
+            return (Printf.sprintf " * Retry %s <%s>"
+                      Ocamlot.(string_of_job task.job)
+                      (rel_url_of_tid tid))
+        | Reclassify (task, old_analyses, new_analyses) ->
+            let s = Sexplib.Sexp.to_string (Ocamlot.sexp_of_task task) in
+            (if dryrun then return ()
+             else Lwt_io.(with_file ~mode:output file
+                            (fun oc -> Lwt_io.write oc s))
+                >>= fun () -> Repo.add ~path:file
+                >>= fun _ -> return ())
+            >>= fun () ->
+            return (Printf.sprintf " * Reclassify %s <%s>\n   from %s\n   to %s"
+                      Ocamlot.(string_of_job task.job)
+                      (rel_url_of_tid tid)
+                      (Result.string_of_analysis_list old_analyses)
+                      (Result.string_of_analysis_list new_analyses))
+    ) tasks
+    >>= fun diffs ->
+    let cmd = String.concat " " (Array.to_list Sys.argv) in
+    let message = cmd^"\n\n"^(String.concat "\n" diffs) in
+    if dryrun then (print_endline message; return ())
+    else Repo.commit ~dir:Serve.state_path ~message >>= fun _ -> return ()
+  ) (Result.die "Ocamlot_cmd.triage")
+end
+
+let infox () =
   let info = Host.detect () in
   Printf.printf "host: %s\n%!" (Host.to_string info)
 
@@ -311,29 +398,70 @@ let testable_of_string s =
   then Pull (int_of_string s)
   else Packages Re_str.(split (regexp_string ",") s)
 let build_cmd =
-  let testable_str = Arg.(required & pos 0 (some string) None & info []
-                            ~docv:"PKGS_ID" ~doc:"Pull identifier or comma-separated package list") in
-  let debug = Arg.(value & flag & info ["debug"]
-                     ~docv:"DEBUG" ~doc:"retain opam install, repository, and build directory") in
-  let overlay = Arg.(value & pos 1 (some string) None & info []
-                       ~docv:"REPO_HREF" ~doc:"opam-repository URI reference to merge last") in
-  let overlay_branch = Arg.(value & pos 2 (some string) None & info []
-                              ~docv:"REPO_BRANCH" ~doc:"branch of $(b,REPO_HREF) to merge last") in
+  let testable_str = Arg.(
+    required & pos 0 (some string) None & info []
+      ~docv:"PKGS_ID"
+      ~doc:"pull identifier or comma-separated package list") in
+  let debug = Arg.(
+    value & flag & info ["debug"]
+      ~docv:"DEBUG"
+      ~doc:"retain opam install, repository, and build directory") in
+  let overlay = Arg.(
+    value & pos 1 (some string) None & info []
+      ~docv:"REPO_HREF"
+      ~doc:"opam-repository URI reference to merge last") in
+  let overlay_branch = Arg.(
+    value & pos 2 (some string) None & info []
+      ~docv:"REPO_BRANCH"
+      ~doc:"branch of $(b,REPO_HREF) to merge last") in
   Term.(pure build_testable $ (pure testable_of_string $ testable_str)
           $ debug $ overlay $ overlay_branch),
   Term.info "build" ~doc:"build a Github OCamlPro/opam-repository pull request"
 
 let mirror_cmd =
-  let ids = Arg.(non_empty & pos_all int [] & info []
-                   ~docv:"PULL_IDS" ~doc:"Pull identifiers to mirror") in
+  let ids = Arg.(
+    non_empty & pos_all int [] & info []
+      ~docv:"PULL_IDS"
+      ~doc:"pull identifiers to mirror") in
   Term.(pure mirror_pulls $ ids),
   Term.info "mirror" ~doc:"mirror the GitHub pull request(s)"
 
 let work_cmd =
-  let url = Arg.(required & pos 0 (some string) None & info []
-                   ~docv:"OCAMLOT_URL" ~doc:"URL of task queue resource") in
+  let url = Arg.(
+    required & pos 0 (some string) None & info []
+      ~docv:"OCAMLOT_URL"
+      ~doc:"URL of task queue resource") in
   Term.(pure work_url $ url),
   Term.info "work" ~doc:"queue for work"
+
+let triage_cmd =
+  let dryrun = Arg.(
+    value & flag & info ["dry-run"]
+      ~docv:"DRYRUN"
+      ~doc:"print the triage message without modifying the state repository") in
+  let meta = Arg.(
+    value & flag & info ["meta"]
+      ~docv:"META"
+      ~doc:"retry metadata and metadata dependency errors") in
+  let trans = Arg.(
+    value & flag & info ["transient"]
+      ~docv:"TRANSIENT"
+      ~doc:"retry transient and transient dependency errors") in
+  let system = Arg.(
+    value & flag & info ["system"]
+      ~docv:"SYSTEM"
+      ~doc:"retry system and system dependency errors") in
+  let retry = Arg.(
+    value & opt_all string [] & info ["retry"]
+      ~docv:"RETRY"
+      ~doc:"unconditionally retry this package and those downstream") in
+  let domain = Arg.(
+    value & pos_all string [] & info []
+      ~docv:"DOMAIN"
+      ~doc:"specific packages to re-analyze") in
+  Term.(pure triage $ dryrun $ meta $ trans $ system $ retry $ domain),
+  Term.info "triage"
+    ~doc:"re-analyze test results"
 
 let info_cmd =
   Term.(pure infox $ pure ()),
@@ -358,7 +486,7 @@ let default_cmd =
 let cmds = [
   list_cmd; show_cmd; open_cmd;
   build_cmd; mirror_cmd; work_cmd;
-  serve_cmd; info_cmd
+  serve_cmd; info_cmd; triage_cmd;
 ]
 
 let handle_sigpipe _ = Printf.eprintf "SIGPIPE\n%!"

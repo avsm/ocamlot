@@ -62,17 +62,29 @@ module Table = struct
         (r, List.map (Hashtbl.find_all ct) cols)::l
        ) tbl.rc_idx [])
 
-  let render tbl render_cell =
+  let render ?row_anchor_prefix tbl render_cell =
+    let row_attrs, row_prefix_head, row_anchor = match row_anchor_prefix with
+      | Some prefix ->
+        (fun rl -> ["id",prefix^"-"^rl]),
+        <:html<<td></td>&>>,
+        (fun rl -> <:html<<th><a href=$str:"#"^prefix^"-"^rl$>#</a></th>&>>)
+      | None -> (fun _ -> []), [], (fun _ -> [])
+    in
     let headers = List.map
       (fun h -> <:html<<th>$str:h$</th>&>>) (columns tbl) in
     let rows = List.map (fun (rl,r) ->
-      <:html<<tr><th>$str:rl$</th>$list:List.map render_cell r$</tr>&>>)
+      <:html<<tr $alist:row_attrs rl$>
+      <th>$str:rl$</th>$list:List.map render_cell r$$row_anchor rl$</tr>&>>)
       (rows tbl) in
     if cell_count tbl > 0
     then <:html<
       <table>
-      <tr><th></th>$list:headers$</tr>
+      <thead>
+      <tr><th></th>$list:headers$$row_prefix_head$</tr>
+      </thead>
+      <tbody>
       $list:rows$
+      </tbody>
       </table>&>>
     else []
 end
@@ -100,9 +112,13 @@ let page ?title body =
          .errwarn { background-color: maroon; }
          .incompatible { background-color: gray; }
          .dependency { background-color: yellow; }
-         .fixable { background-color: orange; }
+         .meta { background-color: orange; }
          .transient { background-color: white; }
+         .system { background-color: pink; }
          .extdep { background-color: blue; }
+
+         tbody th { text-align: left; }
+         tbody th a { color: gray; }
       </style>
       <title>$str:page_title$</title>
     </head>

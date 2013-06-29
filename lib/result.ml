@@ -24,24 +24,42 @@ module Uri = struct
   let sexp_of_t uri = Sexplib.Std.sexp_of_string (to_string uri)
 end
 
+type category =
+  | Incompat
+  | Dependency
+  | Transient
+  | System
+  | Fixable (* Meta *)
+  | Ext_dep
+  | Errorwarn
+  | Broken
+
 type solver_error =
   | Unsatisfied_dep of string (* TODO: this is pkg + constraint right now *)
 with sexp
 
+type system_error =
+  | No_space
+with sexp
+
 type analysis =
   | No_solution of solver_error option
+  | System_error of system_error
   | Incompatible
   | Error_for_warn
   | Checksum of Uri.t * string * string
   | Pkg_config_dep_ext of string
   | Pkg_config_dep_ext_constraint of string * string
   | Header_dep_ext of string
+  | Command_dep_ext of string
   | C_lib_dep_exts of string list
   | Missing_ocamlfind_dep of string
   | Missing_findlib_constraint of string * string
   | Broken_link of Uri.t
   | Dep_error of string * analysis list
 with sexp
+
+type analyses = analysis list with sexp
 
 type error =
   | Process of Repo.proc_status * Repo.r
@@ -62,6 +80,40 @@ type t = {
 let is_failure = function Passed _ -> false | Failed (_,_) -> true
 
 let get_status {status} = status
+
+let worst_of_categories = List.fold_left (max) Incompat
+
+let category_of_analysis = function
+  | Incompatible -> Incompat
+  | Error_for_warn -> Errorwarn
+  | Pkg_config_dep_ext _
+  | Pkg_config_dep_ext_constraint (_,_)
+  | Header_dep_ext _
+  | Command_dep_ext _
+  | C_lib_dep_exts _ -> Ext_dep
+  | Checksum (_,_,_)
+  | Missing_ocamlfind_dep _
+  | Missing_findlib_constraint (_,_) -> Fixable (* Meta *)
+  | System_error _ -> System
+  | Broken_link _ -> Transient
+  | No_solution _
+  | Dep_error (_, _) -> Dependency
+
+let worst_of_analyses analyses =
+  snd (List.fold_left (fun (mc,m) a ->
+    let c = category_of_analysis a in
+    if mc < c then (c,a) else (mc,m)
+  ) (Incompat,Incompatible) analyses)
+
+let string_of_category = function
+  | Broken -> "ERROR"
+  | Errorwarn -> "ERRWARN"
+  | Incompat -> "INCOMPAT"
+  | Dependency -> "DEP"
+  | Fixable -> "META"
+  | System -> "SYSTEM"
+  | Transient -> "TRANS"
+  | Ext_dep -> "EXTDEP"
 
 let rec match_global ?(pos=0) ?(lst=[]) re s =
   let ofs = try Re.(get_all_ofs (exec ~pos re s))
@@ -95,6 +147,10 @@ let pkg_build_error_re = Re.(compile (seq [
   group (rep1 (compl [set "]"]));
 ]))
 
+let no_space_recognizer = Re.((* tested 2013/6/26 *)
+  str "No space left on device", (fun _ -> System_error No_space)
+)
+
 let compile_pair (re,cons) = (Re.compile re,cons)
 let build_error_stderr_re = Re.(List.map compile_pair [
   seq [ (* tested 2013/6/21 *)
@@ -113,6 +169,11 @@ let build_error_stderr_re = Re.(List.map compile_pair [
     group (rep1 (compl [space]));
     str " not found";
   ], (fun m -> Pkg_config_dep_ext m.(1));
+  seq [ (* tested 2013/6/26 *)
+    str "configure: error: Cannot find ";
+    group (rep1 (compl [set "."]));
+    str ".";
+  ], (fun m -> C_lib_dep_exts [m.(1)]);
   seq [ (* tested 2013/6/21 *)
     str "Cannot get ";
     group (rep1 notnl);
@@ -123,6 +184,14 @@ let build_error_stderr_re = Re.(List.map compile_pair [
     group (rep1 (compl [space]));
     str " is not available.";
   ], (fun m -> Broken_link (Uri.of_string m.(1)));
+  seq [ (* tested 2013/6/26 *)
+    str "Internal error:\n";
+    rep space;
+    str "\"";
+    group (rep1 (compl [set "\""]));
+    str "\": command not found.";
+  ], (fun m -> Command_dep_ext m.(1));
+  no_space_recognizer;
 ])
 
 let build_error_stdout_re = Re.(List.map compile_pair [
@@ -131,7 +200,7 @@ let build_error_stdout_re = Re.(List.map compile_pair [
   seq [ (* tested 2013/6/21 *)
     str "Package ";
     group (rep1 (compl [space]));
-    str " was not found in the pkg-config search path.";
+    str " was not found in the pkg-config search path";
   ], (fun m -> Pkg_config_dep_ext m.(1));
   seq [ (* tested 2013/6/21 *)
     str "checking whether pkg-config knows about ";
@@ -141,10 +210,43 @@ let build_error_stdout_re = Re.(List.map compile_pair [
     str "... "; compl [set "o"];
   ], (fun m -> Pkg_config_dep_ext_constraint (m.(1),m.(2)));
   seq [ (* tested 2013/6/21 *)
-    str ": fatal error: ";
+    str ": ";
+    opt (str "fatal ");
+    str "error: ";
     group (rep1 (compl [set "."]));
     str ".h: No such file or directory";
   ], (fun m -> Header_dep_ext m.(1));
+  seq [ (* tested 2013/6/26 *)
+    str ": fatal error: '";
+    group (non_greedy (rep1 any));
+    str ".h' file not found";
+  ], (fun m -> Header_dep_ext m.(1));
+  seq [ (* tested 2013/6/26 *)
+    str "make: ";
+    group (rep1 (compl [set ":"]));
+    str ": ";
+    alt [str "C"; str "c"];
+    str "ommand not found";
+  ], (fun m -> Command_dep_ext m.(1));
+  seq [ (* tested 2013/6/28 *)
+    str "configure: error: '";
+    group (rep1 (compl [set "'"]));
+    str "' command not found";
+  ], (fun m -> Command_dep_ext m.(1));
+  seq [ (* 2013/6/26 *)
+    opt (str "/bin/");
+    alt [str "sh: "; str "env: "];
+    opt (seq [rep1 digit; str ": "]);
+    group (rep1 (compl [set ":"]));
+    str ": ";
+    alt [
+      seq [
+        opt (str "command ");
+        str "not found";
+      ];
+      str "No such file or directory";
+    ];
+  ], (fun m -> Command_dep_ext m.(1));
   seq [ (* tested 2013/6/21 *)
     str "ocamlfind: Package `";
     group (rep1 (compl [set "'"]));
@@ -163,6 +265,15 @@ let build_error_stdout_re = Re.(List.map compile_pair [
     group (rep1 (seq [char ' '; rep1 (compl [space])]));
     str ".";
   ], (fun m -> C_lib_dep_exts Re_str.(split (regexp_string " ") m.(1)));
+  seq [ (* tested 2013/6/26 *)
+    str "ld: library not found for -l";
+    group (rep1 notnl);
+  ], (fun m -> C_lib_dep_exts [m.(1)]);
+  seq [ (* tested 2013/6/28 *)
+    str "ld: cannot find -l";
+    group (rep1 notnl);
+  ], (fun m -> C_lib_dep_exts [m.(1)]);
+  no_space_recognizer;
 ])
 
 let rec search k str = function
@@ -213,11 +324,27 @@ let other_errors_of_r { Repo.r_stderr } =
     else []
   with _ -> []
 
+let system_error_stderr_re = Re.(List.map compile_pair [
+  no_space_recognizer;
+])
+let system_errors_of_r { Repo.r_stderr } =
+  try begin match last_match r_stderr system_error_stderr_re with
+    | Some c -> [c]
+    | None -> []
+  end with _ -> []
+
 let analyze = Repo.(function
-  | Process (Exited 3, r) -> solver_errors_of_r r
-  | Process (Exited 4, r) -> build_errors_of_r r
-  | Process (Exited 66,r) -> other_errors_of_r r
-  | _ -> []
+  | Process (Exited 1,
+             ({ r_cmd = "opam" } as r)) -> system_errors_of_r r
+  | Process (Exited 3,
+             ({ r_cmd = "opam" } as r)) -> solver_errors_of_r r
+  | Process (Exited 4,
+             ({ r_cmd = "opam" } as r)) -> build_errors_of_r r
+  | Process (Exited 66,
+             ({ r_cmd = "opam" } as r)) -> other_errors_of_r r
+  | Process ((Exited 128 | Stopped _ | Signaled _),
+             ({ r_cmd = "git" } as r))  -> system_errors_of_r r
+  | _                                   -> []
 )
 
 let error_of_exn = Repo.(function
@@ -261,6 +388,9 @@ let die site exn =
   Printf.eprintf "stdout: %s\nstderr: %s\n%!" out err;
   exit 1
 
+let string_of_system_error = function
+  | No_space -> "storage exhausted"
+
 let rec string_of_analysis = function
   | No_solution None -> "no constraint solution"
   | No_solution (Some (Unsatisfied_dep dep)) ->
@@ -272,11 +402,13 @@ let rec string_of_analysis = function
   | Pkg_config_dep_ext_constraint (pkg, bound) ->
       "external dependency \""^pkg^"\" must be \""^bound^"\""
   | Header_dep_ext header -> "no external dependency \""^header^".h\""
+  | Command_dep_ext command -> "no external dependency \""^command^"\""
   | C_lib_dep_exts exts -> "no external dependencies: "
       ^(String.concat ", " (List.map (fun ext -> "\""^ext^"\"") exts))
   | Missing_ocamlfind_dep dep -> "missing ocamlfind dependency \""^dep^"\""
   | Missing_findlib_constraint (pkg, bound) ->
       "missing findlib constraint \""^pkg^" "^bound^"\""
+  | System_error sys_err -> "system error: "^(string_of_system_error sys_err)
   | Broken_link uri -> "could not retrieve <"^(Uri.to_string uri)^">"
   | Dep_error (dep, subanalyses) ->
       Printf.sprintf "error in dependency \"%s\" (%s)"
@@ -286,8 +418,8 @@ and string_of_analysis_list = function
   | al -> String.concat ", " (List.map string_of_analysis al)
 
 let string_of_status = function
-  | Passed _ -> "PASSED"
-  | Failed (al,_) -> Printf.sprintf "FAILED (%s)" (string_of_analysis_list al)
+  | Passed _ -> "PASS"
+  | Failed (al,_) -> Printf.sprintf "FAIL (%s)" (string_of_analysis_list al)
 
 let to_html ({ status; duration; info } as t) =
   let err, out = to_bufs t in
